@@ -20,6 +20,13 @@ from curl_cffi import requests as creq  # browser-TLS impersonation (JobStreet/A
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# JobStreet (my.jobstreet.com) is Akamai IP-blocked from datacenter IPs like
+# GitHub Actions runners — it only works from a residential IP (e.g. your PC).
+# Default ON for local runs; the GitHub workflow sets JOBSTREET_ENABLED=false.
+JOBSTREET_ENABLED = os.environ.get("JOBSTREET_ENABLED", "true").strip().lower() not in (
+    "false", "0", "no", "off",
+)
+
 SEEN_FILE = "seen_jobs.json"
 
 KEYWORDS = [
@@ -547,6 +554,9 @@ def main():
         send_test_message()
         return
 
+    sources = "LinkedIn + JobStreet" if JOBSTREET_ENABLED else "LinkedIn only (JobStreet disabled)"
+    print(f"Sources: {sources}")
+
     seen = load_seen()
     new_seen = set(seen)
     new_jobs = []
@@ -559,12 +569,15 @@ def main():
                 new_seen.add(job["id"])
         time.sleep(2)
 
-        # JobStreet (my.jobstreet.com via curl_cffi browser impersonation)
-        for job in fetch_jobs_jobstreet(kw):
-            if job["id"] not in seen and job["id"] not in new_seen and is_relevant(job):
-                new_jobs.append(job)
-                new_seen.add(job["id"])
-        time.sleep(2)
+        # JobStreet (my.jobstreet.com via curl_cffi browser impersonation).
+        # Skipped when JOBSTREET_ENABLED=false (e.g. on GitHub Actions, where the
+        # runner IP is blocked by Akamai — see note at top of file).
+        if JOBSTREET_ENABLED:
+            for job in fetch_jobs_jobstreet(kw):
+                if job["id"] not in seen and job["id"] not in new_seen and is_relevant(job):
+                    new_jobs.append(job)
+                    new_seen.add(job["id"])
+            time.sleep(2)
 
     print(f"Found {len(new_jobs)} new matching job(s).")
     for job in new_jobs:

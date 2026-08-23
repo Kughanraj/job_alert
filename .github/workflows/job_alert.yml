@@ -32,6 +32,9 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # JobStreet's host (Akamai) blocks GitHub's datacenter IPs, so keep it
+          # off in the cloud. Run the script locally to include JobStreet.
+          JOBSTREET_ENABLED: "false"
         run: python linkedin_job_alert.py
 
       - name: Persist seen jobs
