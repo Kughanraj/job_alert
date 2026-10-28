@@ -3,6 +3,12 @@ LinkedIn + JobStreet Job Alert -> Telegram
 
 Checks LinkedIn and JobStreet for new postings matching your keywords/location,
 and pushes new ones to Telegram. Runs on GitHub Actions on a schedule.
+
+Jobs are sorted into "tracks" (Security, Network, Data Centre). A job is sent if
+its title passes at least one track's gate: it must contain one of that track's
+required terms and none of that track's excluded terms. All term matching is
+whole-word, so "hr" no longer matches "threat" and "soc" no longer matches
+"associate".
 """
 
 import os
@@ -11,6 +17,8 @@ import json
 import time
 import html
 import re
+from datetime import datetime, timedelta, timezone
+
 import requests
 from bs4 import BeautifulSoup
 from curl_cffi import requests as creq  # browser-TLS impersonation (JobStreet/Akamai)
@@ -28,15 +36,19 @@ JOBSTREET_ENABLED = os.environ.get("JOBSTREET_ENABLED", "true").strip().lower() 
 )
 
 SEEN_FILE = "seen_jobs.json"
+# Forget a job ID this many days after it was first seen. LinkedIn/JobStreet
+# listings rarely stay up longer, and the search window is only hours wide.
+SEEN_RETENTION_DAYS = 60
 
-KEYWORDS = [
+# ---- Search keywords (what gets queried; the track gates below decide what's sent)
+
+SECURITY_KEYWORDS = [
     # Core SOC titles (primary focus)
     "SOC Analyst",
     "SOC Engineer",
     "Security Operations Center",
     "Security Operations",
     "Cyber Security Analyst",
-
     # Broader cybersecurity
     "Cybersecurity",
     "Cyber Security",
@@ -46,27 +58,46 @@ KEYWORDS = [
     "IT Security",
     "Network Security",
     "Cyber Defence",
-
     # Detection / response / intel
     "Incident Response",
     "Threat Analyst",
     "Threat Intelligence",
     "SIEM",
     "Vulnerability Analyst",
-
     # Offensive / GRC
     "Penetration Tester",
     "VAPT",
     "Security Consultant",
     "GRC",
+    "Associate Security",
+]
 
-    # Fresh grad entry points
+NETWORK_KEYWORDS = [
+    "Network Engineer",
+    "Junior Network Engineer",
+    "Network Administrator",
+    "Network Support Engineer",
+    "NOC Engineer",
+]
+
+DATACENTRE_KEYWORDS = [
+    "Data Centre Technician",
+    "Data Center Technician",
+    "Data Centre Engineer",
+    "Data Center Operations",
+    "Critical Facilities Technician",
+]
+
+# Fresh-grad entry points — broad, so they only pull candidates; a job still has
+# to pass one of the track gates to be sent.
+FRESH_GRAD_KEYWORDS = [
     "Fresh Graduate",
     "Graduate Trainee",
     "Graduate Programme",
     "Management Trainee",
-    "Associate Security",
 ]
+
+KEYWORDS = SECURITY_KEYWORDS + NETWORK_KEYWORDS + DATACENTRE_KEYWORDS + FRESH_GRAD_KEYWORDS
 
 # LinkedIn — single centre-point + radius (25 miles ~ 40km covers full Klang Valley)
 LINKEDIN_LOCATION = "Kuala Lumpur, Malaysia"
@@ -74,7 +105,7 @@ DISTANCE_MILES = 25
 
 # JobStreet — per-location configs with keyword scoping
 # KL/Selangor : all keywords
-# Johor Bahru : DC/infra keywords only (data center boom)
+# Johor Bahru : security + DC/network keywords (data centre boom)
 # Penang      : target companies only (manufacturing IT, selective)
 JOBSTREET_LOCATION_CONFIGS = [
     {
@@ -97,6 +128,13 @@ JOBSTREET_LOCATION_CONFIGS = [
             "Cybersecurity",
             "Information Security",
             "Incident Response",
+            "Network Engineer",
+            "NOC Engineer",
+            "Data Centre Technician",
+            "Data Center Technician",
+            "Data Centre Engineer",
+            "Data Center Operations",
+            "Critical Facilities Technician",
         ],
         "companies_only": False,
     },
@@ -107,6 +145,7 @@ JOBSTREET_LOCATION_CONFIGS = [
             "Security Analyst",
             "IT Security",
             "Information Security",
+            "Network Engineer",
         ],
         "companies_only": True,  # only post if it's a target company
     },
@@ -121,70 +160,111 @@ JOBSTREET_DATERANGE_DAYS = 1
 
 RESULTS_PER_KEYWORD = 25
 
-# Titles containing any of these are silently skipped (case-insensitive)
-EXCLUDE_TITLE_KEYWORDS = [
-    # Seniority
-    "senior", "sr.", "lead", "principal", "head of", "director",
+# ---- Title filters (all matched as whole words/phrases, case-insensitive)
+
+# Applies to every track
+SENIORITY_EXCLUDE = [
+    "senior", "sr", "lead", "principal", "head of", "director",
     "manager", "supervisor", "vp", "vice president",
     "5+ years", "7+ years", "10+ years",
-    # Wrong domains
+    "internship", "intern", "interns",
+]
+
+# Wrong-domain titles. Used by the Security and Network tracks.
+DOMAIN_EXCLUDE = [
     "software", "frontend", "backend", "fullstack", "full stack",
     "mobile", "android", "ios", "flutter", "react", "devops",
     "data scientist", "data engineer", "machine learning engineer",
     "mechanical", "electrical", "civil", "structural", "quantity surveyor",
     "food", "kitchen", "chef", "barista", "crew", "cashier",
-    "security guard", "security officer", "physical security",
     "marketing", "sales", "business development", "bd",
-    "hr", "human resource", "recruitment", "talent acquisition",
+    "hr", "human resource", "human resources", "recruitment", "talent acquisition",
     "credit", "loan", "mortgage", "insurance", "actuarial",
     "driver", "despatch", "cleaner", "housekeeping",
     "japanese", "mandarin", "korean", "arabic",
-    "internship", "intern",
     "qc", "qa", "procurement", "data analyst",
-    "backup", "cloud", "quality", "maintenance", "cleanroom",
+    "backup", "quality", "maintenance", "cleanroom",
     "transaction", "medical",
     "travel", "customer", "test process", "inventory",
     "developer", "content", "logistics", "equipment", "qs",
-    "chemical","solar", "pest","clerk", "assembler", "bartender",
-    "hospitality", "controls"
+    "chemical", "solar", "pest", "clerk", "assembler", "bartender",
+    "hospitality", "controls",
 ]
 
-# Positive gate: a job is only kept if its title contains at least one of these
-# (case-insensitive). This stops broad keywords like "Fresh Graduate" or "GRC"
-# from pulling in unrelated roles — the title itself must be security-related.
-REQUIRE_TITLE_KEYWORDS = [
-    "soc", "security", "cyber", "cybersecurity",
-    "threat", "incident", "vulnerability", "vapt",
-    "penetration", "pentest", "siem", "grc",
-    "information security", "infosec", "malware",
-    "forensic", "red team", "blue team", "detection",
+# Data-centre technician roles are often facilities-side (power, cooling), so
+# don't block electrical/mechanical/maintenance/equipment/controls for that track.
+DC_ALLOWED_DOMAIN_TERMS = {"electrical", "mechanical", "maintenance", "equipment", "controls"}
+DATACENTRE_DOMAIN_EXCLUDE = [t for t in DOMAIN_EXCLUDE if t not in DC_ALLOWED_DOMAIN_TERMS]
+
+# Physical-security titles ("Security Officer") are dropped unless the title
+# also says it's an IT/cyber role ("IT Security Officer").
+PHYSICAL_SECURITY_TERMS = ["security guard", "security officer", "physical security", "guard"]
+CYBER_CONTEXT_TERMS = ["it", "ict", "information", "cyber", "cybersecurity", "network", "soc"]
+
+TRACKS = [
+    {
+        "name": "Security",
+        "icon": "\U0001F6E1️",  # 🛡️
+        "require": [
+            "soc", "security", "cyber", "cybersecurity",
+            "threat", "incident", "vulnerability", "vapt",
+            "penetration", "pentest", "pentester", "siem", "grc",
+            "infosec", "malware", "forensic", "forensics",
+            "red team", "blue team", "detection",
+        ],
+        "exclude": DOMAIN_EXCLUDE,
+    },
+    {
+        "name": "Network",
+        "icon": "\U0001F310",  # 🌐
+        "require": [
+            "network engineer", "network engineers", "network administrator",
+            "network admin", "network support", "network operations",
+            "network technician", "network specialist", "network analyst",
+            "network infrastructure", "networking", "noc",
+        ],
+        "exclude": DOMAIN_EXCLUDE,
+    },
+    {
+        "name": "Data Centre",
+        "icon": "\U0001F5C4️",  # 🗄️
+        "require": [
+            "data centre", "data center", "datacentre", "datacenter",
+            "data centres", "data centers",
+            "dc technician", "dc engineer", "dc operations",
+            "critical facilities", "critical facility", "critical environment",
+        ],
+        "exclude": DATACENTRE_DOMAIN_EXCLUDE,
+    },
 ]
 
-# Jobs from these companies get a ⭐ PRIORITY flag in the Telegram message
+# Jobs from these companies get a ⭐ PRIORITY flag in the Telegram message.
+# Matched as whole words against the company name, so keep short names specific
+# (e.g. "time dotcom", not "time").
 TARGET_COMPANIES = [
     # Central bank / regulators
     "bank negara malaysia", "bnm",
     # Commercial banks
     "maybank", "malayan banking",
-    "cimb", "cimb group",
+    "cimb",
     "public bank",
-    "rhb", "rhb bank",
-    "ambank", "ambank group",
+    "rhb",
+    "ambank",
     "hong leong bank", "hong leong",
     "alliance bank",
-    "hsbc malaysia", "hsbc",
+    "hsbc",
     "standard chartered",
-    "affin bank",
-    "mbsb", "mbsb bank berhad",
+    "affin bank", "affin",
+    "mbsb",
     "kenanga",
     # Islamic banks
     "bank islam",
     # Digital banks
-    "tng digital", "tng",
-    "gxbank",
+    "tng digital", "touch n go", "touch 'n go",
+    "gxbank", "gx bank",
     "ryt bank",
     "bigpay",
-    "boost",
+    "boost bank", "boost holdings", "boost credit",
     # Payment infra
     "paynet",
     "setel",
@@ -193,39 +273,49 @@ TARGET_COMPANIES = [
     "pnb", "permodalan nasional berhad",
     # Telcos
     "maxis",
-    "celcomdigi", "celcom",
-    "telekom malaysia", "tm",
-    "time dotcom", "time",
+    "celcomdigi", "celcom", "digi telecommunications",
+    "telekom malaysia", "tm one", "tm global", "tm technology services", "unifi",
+    "time dotcom", "timedotcom",
     "u mobile",
     # Network / security vendors
     "cisco",
     "huawei",
     "fortinet",
-    "palo alto networks", "palo alto",
-    "juniper networks", "juniper",
-    "f5 networks",
+    "palo alto networks",
+    "juniper networks",
+    "f5", "f5 networks",
     # Cloud / big tech
     "microsoft",
     "google",
-    "amazon", "aws",
+    "amazon", "aws", "amazon web services",
     "dell technologies", "dell",
     "hpe", "hewlett packard enterprise",
-    "amd",
+    "amd", "advanced micro devices",
     # System integrators / MSPs
     "accenture",
-    "bridgenet solutions sdn bhd", "bridgenet",
-    "ntt malaysia", "ntt",
+    "bridgenet",
+    "ntt", "ntt data", "ntt malaysia",
     "dimension data",
     "dxc technology", "dxc",
-    "ibm malaysia", "ibm",
+    "ibm",
     "avanade",
     # Government cybersecurity agencies
     "cybersecurity malaysia",
     "nacsa",
     "mdec",
     "mcmc",
-    # Data centers
-    "aims data centre", "aims",
+    # Data centres
+    "aims data centre", "aims data center", "aims group",
+    "vads",
+    "bridge data centres", "bridge data centers",
+    "yondr",
+    "equinix",
+    "stack infrastructure",
+    "princeton digital group",
+    "keppel data centres",
+    "digital realty",
+    "airtrunk",
+    "ytl data centre", "ytl",
     # Fintech
     "grabpay", "grab",
     "slb", "schlumberger",
@@ -248,24 +338,102 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ------------------------------------------------------------------
+# ------------------------------------------------------------------ Matching
+
+
+def _term_pattern(term):
+    """Whole-word/phrase pattern: the term can't be glued to other letters or digits."""
+    return r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])"
+
+
+def build_matcher(terms):
+    """Compile a list of terms into one case-insensitive whole-word regex."""
+    if not terms:
+        return re.compile(r"(?!x)x")  # matches nothing
+    # Longest first so multi-word phrases win over their single-word prefixes.
+    ordered = sorted({_normalise(t) for t in terms if _normalise(t)}, key=len, reverse=True)
+    return re.compile("|".join(_term_pattern(t) for t in ordered), re.IGNORECASE)
+
+
+def _normalise(text):
+    # Treat separators like "-", "/", "|" and "&" as spaces so "Network/Security"
+    # and "Data-Centre" still match their phrases.
+    text = (text or "").lower()
+    text = re.sub(r"[\-_/|&,()\[\]]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+SENIORITY_RE = build_matcher(SENIORITY_EXCLUDE)
+PHYSICAL_RE = build_matcher(PHYSICAL_SECURITY_TERMS)
+CYBER_CONTEXT_RE = build_matcher(CYBER_CONTEXT_TERMS)
+TARGET_RE = build_matcher(TARGET_COMPANIES)
+for _t in TRACKS:
+    _t["require_re"] = build_matcher(_t["require"])
+    _t["exclude_re"] = build_matcher(_t["exclude"])
+
+
+def match_tracks(title):
+    """Return the names of every track whose gate this title passes."""
+    t = _normalise(title)
+    if SENIORITY_RE.search(t):
+        return []
+    if PHYSICAL_RE.search(t) and not CYBER_CONTEXT_RE.search(t):
+        return []
+    return [
+        trk["name"] for trk in TRACKS
+        if trk["require_re"].search(t) and not trk["exclude_re"].search(t)
+    ]
+
+
+def is_target_company(company):
+    return bool(TARGET_RE.search(_normalise(company)))
+
+
+# ------------------------------------------------------------------ Seen store
+
+
+def _now():
+    return datetime.now(timezone.utc)
 
 
 def load_seen():
-    if os.path.exists(SEEN_FILE):
+    """
+    Returns {job_id: first_seen_iso}. Accepts the old {"seen_ids": [...]} format
+    too; those IDs are stamped with the current time so they age out normally.
+    """
+    if not os.path.exists(SEEN_FILE):
+        return {}
+    try:
+        with open(SEEN_FILE, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+    if isinstance(data.get("seen"), dict):
+        return {str(k): str(v) for k, v in data["seen"].items()}
+
+    stamp = _now().isoformat(timespec="seconds")
+    return {str(i): stamp for i in data.get("seen_ids", [])}
+
+
+def save_seen(seen):
+    cutoff = _now() - timedelta(days=SEEN_RETENTION_DAYS)
+    kept = {}
+    for job_id, stamp in seen.items():
         try:
-            with open(SEEN_FILE, "r") as f:
-                return set(json.load(f).get("seen_ids", []))
-        except (json.JSONDecodeError, OSError):
-            return set()
-    return set()
-
-
-def save_seen(seen_ids):
-    # Cap at 1000 to prevent file bloating over time
-    trimmed = list(seen_ids)[-1000:]
+            when = datetime.fromisoformat(stamp)
+        except ValueError:
+            when = _now()
+        if when >= cutoff:
+            kept[job_id] = when.isoformat(timespec="seconds")
+    # Stable, sorted output keeps the bot's commits small and readable.
+    ordered = dict(sorted(kept.items(), key=lambda kv: (kv[1], kv[0])))
     with open(SEEN_FILE, "w") as f:
-        json.dump({"seen_ids": trimmed}, f, indent=2)
+        json.dump({"seen": ordered}, f, indent=2)
+        f.write("\n")
+
+
+# ------------------------------------------------------------------ Salary
 
 
 def parse_salary_myr(salary_text):
@@ -276,20 +444,24 @@ def parse_salary_myr(salary_text):
         "MYR 3,000 - MYR 5,000 per month"  -> 3000
         "RM3500/month"                       -> 3500
         "MYR 42,000 per year"               -> 3500
+        "RM 3.5k - 4.5k"                     -> 3500
     """
     if not salary_text:
         return None
     text = salary_text.replace(",", "").upper()
-    numbers = [int(n) for n in re.findall(r"\d+", text)]
-    if not numbers:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(K)?", text)
+    if not m:
         return None
-    lower = numbers[0]
+    lower = float(m.group(1))
+    if m.group(2):
+        lower *= 1000
     if "YEAR" in text or "ANNUAL" in text or lower > 50000:
-        lower = lower // 12
-    return lower
+        lower = lower / 12
+    return int(lower)
 
 
 # ------------------------------------------------------------------ LinkedIn
+
 
 def fetch_jobs_linkedin(keyword):
     url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
@@ -300,11 +472,20 @@ def fetch_jobs_linkedin(keyword):
         "f_TPR": f"r{TIME_WINDOW_SECONDS}",
         "start": 0,
     }
-    try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"[warn] LinkedIn request failed for '{keyword}': {e}")
+    resp = None
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            if resp.status_code == 429 and attempt == 0:
+                print(f"[warn] LinkedIn rate-limited on '{keyword}', backing off 30s")
+                time.sleep(30)
+                continue
+            resp.raise_for_status()
+            break
+        except requests.RequestException as e:
+            print(f"[warn] LinkedIn request failed for '{keyword}': {e}")
+            return []
+    if resp is None or not resp.ok:
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -336,13 +517,14 @@ def fetch_jobs_linkedin(keyword):
                 "source": "LinkedIn",
                 "companies_only": False,
             })
-        except AttributeError:
+        except (AttributeError, KeyError):
             continue
 
     return jobs
 
 
 # ------------------------------------------------------------------ JobStreet
+
 
 def _parse_jobstreet_redux(html_text):
     """Pull the jobs list out of the window.SEEK_REDUX_DATA blob embedded in the page."""
@@ -440,18 +622,15 @@ def fetch_jobs_jobstreet(keyword):
 
 # ------------------------------------------------------------------ Filters
 
+
 def is_relevant(job):
-    title = job["title"].lower()
-    loc = job["location"].lower()
-    companies_only = job.get("companies_only", False)
-
-    # Exclude seniority / wrong domain keywords from title
-    if any(kw in title for kw in EXCLUDE_TITLE_KEYWORDS):
+    """True if the job passes a track gate plus the location/company/salary rules.
+    Stores the matched tracks on job["tracks"] for the Telegram message."""
+    tracks = match_tracks(job.get("title", ""))
+    if not tracks:
         return False
 
-    # Positive gate: title must be security-related (kills broad-keyword noise)
-    if not any(kw in title for kw in REQUIRE_TITLE_KEYWORDS):
-        return False
+    loc = job.get("location", "").lower()
 
     # Physical roles only
     if "remote" in loc:
@@ -462,10 +641,8 @@ def is_relevant(job):
         return False
 
     # Penang: only post if it's a target company
-    if companies_only:
-        company_lower = job.get("company", "").lower()
-        if not any(tc in company_lower for tc in TARGET_COMPANIES):
-            return False
+    if job.get("companies_only", False) and not is_target_company(job.get("company", "")):
+        return False
 
     # Salary filter: only skip if salary is explicitly shown AND below threshold
     salary_text = job.get("salary_text", "")
@@ -474,52 +651,79 @@ def is_relevant(job):
         if lower_bound is not None and lower_bound < MIN_SALARY_MYR:
             return False
 
+    job["tracks"] = tracks
     return True
 
 
 # ------------------------------------------------------------------ Telegram
 
-def send_telegram(job):
+TRACK_ICONS = {t["name"]: t["icon"] for t in TRACKS}
+
+
+def format_message(job):
     source = job.get("source", "LinkedIn")
     icon = "\U0001F535" if source == "LinkedIn" else "\U0001F7E1"  # 🔵 🟡
 
     # Priority flag if company is in your target list
-    company_lower = job.get("company", "").lower()
-    is_priority = any(tc in company_lower for tc in TARGET_COMPANIES)
-    priority_tag = "\u2B50 <b>PRIORITY COMPANY</b>\n" if is_priority else ""
+    priority_tag = (
+        "⭐ <b>PRIORITY COMPANY</b>\n" if is_target_company(job.get("company", "")) else ""
+    )
+
+    tracks = job.get("tracks") or []
+    track_line = ""
+    if tracks:
+        track_line = " ".join(f"{TRACK_ICONS.get(t, '')} {html.escape(t)}" for t in tracks) + "\n"
 
     salary_line = ""
     if job.get("salary_text"):
         salary_line = f"\U0001F4B0 {html.escape(str(job['salary_text']))}\n"
 
-    text = (
+    return (
         f"{priority_tag}"
         f"{icon} <b>[{source}]</b>  \U0001F195 <b>{html.escape(job['title'])}</b>\n"
+        f"{track_line}"
         f"\U0001F3E2 {html.escape(job['company'])}\n"
         f"\U0001F4CD {html.escape(job['location'])}\n"
         f"{salary_line}"
         f"\U0001F552 Posted: {html.escape(job['posted'])}\n"
         f"\U0001F50E Keyword: {html.escape(job['matched_keyword'])}\n"
-        f'<a href="{job["link"]}">Apply / View</a>'
+        f'<a href="{html.escape(job["link"], quote=True)}">Apply / View</a>'
     )
 
+
+def send_telegram(job):
+    """Send one job. Returns True only if Telegram accepted it."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
+        "text": format_message(job),
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
-    try:
-        r = requests.post(url, data=payload, timeout=15)
-        r.raise_for_status()
-    except requests.RequestException as e:
-        print(f"[warn] Telegram send failed: {e}")
+    for attempt in range(2):
+        try:
+            r = requests.post(url, data=payload, timeout=15)
+        except requests.RequestException as e:
+            print(f"[warn] Telegram send failed: {e}")
+            return False
+        if r.status_code == 429 and attempt == 0:
+            # Telegram tells us how long to wait when we send too fast.
+            try:
+                wait = int(r.json().get("parameters", {}).get("retry_after", 5))
+            except ValueError:
+                wait = 5
+            time.sleep(min(wait, 60))
+            continue
+        if not r.ok:
+            print(f"[warn] Telegram send failed: HTTP {r.status_code} {r.text[:200]}")
+            return False
+        return True
+    return False
 
 
 def send_test_message():
-    send_telegram({
-        "title": "Setup check \u2705",
+    ok1 = send_telegram({
+        "title": "Setup check ✅",
         "company": "Maybank",
         "location": "Kuala Lumpur, Malaysia",
         "salary_text": "MYR 4,000 - MYR 6,000",
@@ -527,10 +731,10 @@ def send_test_message():
         "matched_keyword": "this is a test — not a real job",
         "link": "https://www.linkedin.com/jobs/",
         "source": "LinkedIn",
-        "companies_only": False,
+        "tracks": ["Security"],
     })
-    send_telegram({
-        "title": "Setup check \u2705",
+    ok2 = send_telegram({
+        "title": "Setup check ✅",
         "company": "Unknown Co",
         "location": "Selangor, Malaysia",
         "salary_text": "",
@@ -538,12 +742,17 @@ def send_test_message():
         "matched_keyword": "this is a test — not a real job",
         "link": "https://www.jobstreet.com.my/jobs",
         "source": "JobStreet",
-        "companies_only": False,
+        "tracks": ["Network", "Data Centre"],
     })
-    print("Two test messages sent (LinkedIn priority + JobStreet non-priority). Check Telegram.")
+    if ok1 and ok2:
+        print("Two test messages sent (LinkedIn priority + JobStreet non-priority). Check Telegram.")
+    else:
+        print("[error] At least one test message failed — see warnings above.")
+        sys.exit(1)
 
 
 # ------------------------------------------------------------------ Main
+
 
 def main():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -556,17 +765,22 @@ def main():
 
     sources = "LinkedIn + JobStreet" if JOBSTREET_ENABLED else "LinkedIn only (JobStreet disabled)"
     print(f"Sources: {sources}")
+    print(f"Tracks: {', '.join(t['name'] for t in TRACKS)} | {len(KEYWORDS)} keywords")
 
     seen = load_seen()
-    new_seen = set(seen)
+    queued = set()  # IDs picked up this run (avoid duplicates across keywords)
     new_jobs = []
 
+    def consider(job):
+        if job["id"] in seen or job["id"] in queued:
+            return
+        if is_relevant(job):
+            new_jobs.append(job)
+            queued.add(job["id"])
+
     for kw in KEYWORDS:
-        # LinkedIn
         for job in fetch_jobs_linkedin(kw):
-            if job["id"] not in seen and job["id"] not in new_seen and is_relevant(job):
-                new_jobs.append(job)
-                new_seen.add(job["id"])
+            consider(job)
         time.sleep(2)
 
         # JobStreet (my.jobstreet.com via curl_cffi browser impersonation).
@@ -574,17 +788,23 @@ def main():
         # runner IP is blocked by Akamai — see note at top of file).
         if JOBSTREET_ENABLED:
             for job in fetch_jobs_jobstreet(kw):
-                if job["id"] not in seen and job["id"] not in new_seen and is_relevant(job):
-                    new_jobs.append(job)
-                    new_seen.add(job["id"])
+                consider(job)
             time.sleep(2)
 
     print(f"Found {len(new_jobs)} new matching job(s).")
+    sent = failed = 0
     for job in new_jobs:
-        send_telegram(job)
+        # Only remember a job once Telegram has actually accepted it, so a
+        # failed send gets retried on the next run instead of being lost.
+        if send_telegram(job):
+            seen[job["id"]] = _now().isoformat(timespec="seconds")
+            sent += 1
+        else:
+            failed += 1
         time.sleep(1)
+    print(f"Sent {sent}, failed {failed} (failed ones will be retried next run).")
 
-    save_seen(new_seen)
+    save_seen(seen)
 
 
 if __name__ == "__main__":
