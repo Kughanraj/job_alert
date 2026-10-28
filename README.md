@@ -17,7 +17,7 @@ the company is on your target list.
 
 ## How it works
 
-- A GitHub Actions workflow runs `linkedin_job_alert.py` every 2 hours, 8am–10pm
+- A GitHub Actions workflow runs `linkedin_job_alert.py` every 2 hours, 8:17am–10:17pm
   Malaysia time (8 runs/day).
 - For every search keyword, the script pulls LinkedIn's public job-search results
   from the last 3 hours and JobStreet's search API results from the last 24 hours

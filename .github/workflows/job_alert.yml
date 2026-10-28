@@ -2,8 +2,9 @@ name: LinkedIn Job Alert
 
 on:
   schedule:
-    # Every 2 hours, 8am-10pm Malaysia time (UTC+8) -> 00:00-14:00 UTC
-    - cron: "0 0,2,4,6,8,10,12,14 * * *"
+    # Every 2 hours, 8:17am-10:17pm Malaysia time (UTC+8) -> 00:17-14:17 UTC.
+    # Minute 17, not 0: GitHub drops/delays top-of-the-hour schedules most often.
+    - cron: "17 0,2,4,6,8,10,12,14 * * *"
   workflow_dispatch: {}  # lets you trigger it manually from the Actions tab
 
 permissions:
