@@ -21,16 +21,15 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
-from curl_cffi import requests as creq  # browser-TLS impersonation (JobStreet/Akamai)
 
 # ----------------------------- CONFIG -----------------------------
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# JobStreet (my.jobstreet.com) is Akamai IP-blocked from datacenter IPs like
-# GitHub Actions runners — it only works from a residential IP (e.g. your PC).
-# Default ON for local runs; the GitHub workflow sets JOBSTREET_ENABLED=false.
+# JobStreet is read through its public JSON search API, which works from
+# GitHub Actions runners (the HTML search page does not). Set
+# JOBSTREET_ENABLED=false to switch it off.
 JOBSTREET_ENABLED = os.environ.get("JOBSTREET_ENABLED", "true").strip().lower() not in (
     "false", "0", "no", "off",
 )
@@ -445,10 +444,14 @@ def parse_salary_myr(salary_text):
         "RM3500/month"                       -> 3500
         "MYR 42,000 per year"               -> 3500
         "RM 3.5k - 4.5k"                     -> 3500
+        "RM 7.000 – RM 10.000 per month"     -> 7000  (dot as thousands separator)
     """
     if not salary_text:
         return None
-    text = salary_text.replace(",", "").upper()
+    text = salary_text.upper()
+    # "7.000" / "10.000.000": dots followed by exactly three digits are thousands separators
+    text = re.sub(r"(?<=\d)\.(?=\d{3}(?!\d))", "", text)
+    text = text.replace(",", "")
     m = re.search(r"(\d+(?:\.\d+)?)\s*(K)?", text)
     if not m:
         return None
@@ -526,26 +529,52 @@ def fetch_jobs_linkedin(keyword):
 # ------------------------------------------------------------------ JobStreet
 
 
-def _parse_jobstreet_redux(html_text):
-    """Pull the jobs list out of the window.SEEK_REDUX_DATA blob embedded in the page."""
-    m = re.search(r"window\.SEEK_REDUX_DATA\s*=\s*(\{.*?\});", html_text, re.DOTALL)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return []
-    return data.get("results", {}).get("results", {}).get("jobs", []) or []
+JOBSTREET_API_URL = "https://my.jobstreet.com/api/jobsearch/v5/search"
+JOBSTREET_PAGE_SIZE = 30
+JOBSTREET_MAX_PAGES = 2  # 60 results per keyword/location is plenty for a 24h window
+
+
+def _jobstreet_job(j, fallback_loc, keyword, companies_only):
+    """Map one JobStreet API result to the shared job dict, or None if unusable."""
+    raw_id = str(j.get("id") or "")
+    if not raw_id:
+        return None
+
+    advertiser = j.get("advertiser") or {}
+    company = j.get("companyName") or advertiser.get("description") or "Unknown"
+
+    locations = j.get("locations") or []
+    loc_label = (locations[0].get("label") if locations else None) or fallback_loc
+    country = ((locations[0].get("countryCode") if locations else "") or "").upper()
+
+    # Fold work arrangement (On-site / Hybrid / Remote) into the location string
+    # so the shared remote filter in is_relevant() still applies.
+    arrangements = ((j.get("workArrangements") or {}).get("data")) or []
+    arr = ", ".join(
+        t for t in ((a.get("label") or {}).get("text", "") for a in arrangements) if t
+    )
+    location_str = f"{loc_label} ({arr})" if arr else loc_label
+
+    return {
+        "id": f"js_{raw_id}",
+        "title": j.get("title") or "",
+        "company": company,
+        "location": location_str,
+        "salary_text": j.get("salaryLabel") or "",
+        "link": f"https://my.jobstreet.com/job/{raw_id}",
+        "posted": j.get("listingDateDisplay") or j.get("listingDate") or "recently",
+        "matched_keyword": keyword,
+        "source": "JobStreet",
+        "country": country,
+        "companies_only": companies_only,
+    }
 
 
 def fetch_jobs_jobstreet(keyword):
     """
-    Scrapes JobStreet (my.jobstreet.com, SEEK platform) per JOBSTREET_LOCATION_CONFIGS.
-    Uses curl_cffi to impersonate a real browser's TLS handshake — the plain
-    `requests` client gets 403'd by Akamai bot detection.
-
-    Each config defines which keywords apply and whether to restrict to target
-    companies only (e.g. Penang).
+    Queries JobStreet's public search API (my.jobstreet.com, SEEK platform) per
+    JOBSTREET_LOCATION_CONFIGS. Each config defines which keywords apply and
+    whether to restrict to target companies only (e.g. Penang).
     """
     all_jobs = []
     seen_in_call = set()
@@ -559,63 +588,39 @@ def fetch_jobs_jobstreet(keyword):
         if allowed_keywords != "all" and keyword not in allowed_keywords:
             continue
 
-        params = {
-            "keywords": keyword,
-            "where": loc,
-            "daterange": JOBSTREET_DATERANGE_DAYS,
-        }
-        try:
-            resp = creq.get(
-                "https://my.jobstreet.com/jobs",
-                params=params,
-                impersonate="chrome",
-                timeout=20,
-            )
-            resp.raise_for_status()
-        except Exception as e:  # curl_cffi raises its own error types
-            print(f"[warn] JobStreet request failed for '{keyword}' in {loc}: {e}")
-            time.sleep(2)
-            continue
-
-        for j in _parse_jobstreet_redux(resp.text):
+        for page in range(1, JOBSTREET_MAX_PAGES + 1):
+            params = {
+                "siteKey": "MY-Main",
+                "sourcesystem": "houston",
+                "locale": "en-MY",
+                "keywords": keyword,
+                "where": loc,
+                "daterange": JOBSTREET_DATERANGE_DAYS,
+                "page": page,
+                "pageSize": JOBSTREET_PAGE_SIZE,
+            }
             try:
-                raw_id = j.get("id") or ""
-                job_id = f"js_{raw_id}"
-                if not raw_id or job_id in seen_in_call:
+                resp = requests.get(JOBSTREET_API_URL, params=params, headers=HEADERS, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+            except (requests.RequestException, ValueError) as e:
+                print(f"[warn] JobStreet request failed for '{keyword}' in {loc}: {e}")
+                break
+
+            results = data.get("data") or []
+            for j in results:
+                try:
+                    job = _jobstreet_job(j, loc, keyword, companies_only)
+                except (KeyError, TypeError, AttributeError):
                     continue
+                if job and job["id"] not in seen_in_call:
+                    seen_in_call.add(job["id"])
+                    all_jobs.append(job)
 
-                advertiser = j.get("advertiser") or {}
-                company = j.get("companyName") or advertiser.get("description") or "Unknown"
-
-                locations = j.get("locations") or []
-                loc_label = locations[0].get("label") if locations else loc
-
-                # Fold work arrangement (On-site / Hybrid / Remote) into the location
-                # string so the shared is_relevant() remote filter still applies.
-                arrangements = ((j.get("workArrangements") or {}).get("data")) or []
-                arr_texts = [
-                    (a.get("label") or {}).get("text", "") for a in arrangements
-                ]
-                arr = ", ".join(t for t in arr_texts if t)
-                location_str = f"{loc_label} ({arr})" if arr else loc_label
-
-                seen_in_call.add(job_id)
-                all_jobs.append({
-                    "id": job_id,
-                    "title": j.get("title") or "",
-                    "company": company,
-                    "location": location_str,
-                    "salary_text": j.get("salaryLabel") or "",
-                    "link": f"https://my.jobstreet.com/job/{raw_id}",
-                    "posted": j.get("listingDateDisplay") or j.get("listingDate") or "recently",
-                    "matched_keyword": keyword,
-                    "source": "JobStreet",
-                    "companies_only": companies_only,
-                })
-            except (KeyError, TypeError, AttributeError):
-                continue
-
-        time.sleep(2)
+            total = data.get("totalCount") or 0
+            time.sleep(1.5)
+            if len(results) < JOBSTREET_PAGE_SIZE or page * JOBSTREET_PAGE_SIZE >= total:
+                break
 
     return all_jobs
 
@@ -637,6 +642,8 @@ def is_relevant(job):
         return False
 
     # Malaysia only
+    if job.get("country") and job["country"] != "MY":
+        return False
     if any(c in loc for c in ["singapore", "indonesia", "thailand", "philippines"]):
         return False
 
@@ -755,7 +762,8 @@ def send_test_message():
 
 
 def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    dry_run = "--dry-run" in sys.argv
+    if not dry_run and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
         print("[error] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars missing.")
         sys.exit(1)
 
@@ -783,15 +791,18 @@ def main():
             consider(job)
         time.sleep(2)
 
-        # JobStreet (my.jobstreet.com via curl_cffi browser impersonation).
-        # Skipped when JOBSTREET_ENABLED=false (e.g. on GitHub Actions, where the
-        # runner IP is blocked by Akamai — see note at top of file).
+        # JobStreet (public search API). Skipped when JOBSTREET_ENABLED=false.
         if JOBSTREET_ENABLED:
             for job in fetch_jobs_jobstreet(kw):
                 consider(job)
-            time.sleep(2)
 
     print(f"Found {len(new_jobs)} new matching job(s).")
+    if dry_run:
+        for job in new_jobs:
+            print(f"  [{job['source']}] [{', '.join(job['tracks'])}] {job['title']} | "
+                  f"{job['company']} | {job['location']} | {job['salary_text'] or '-'}")
+        print("Dry run: nothing sent, seen_jobs.json not updated.")
+        return
     sent = failed = 0
     for job in new_jobs:
         # Only remember a job once Telegram has actually accepted it, so a

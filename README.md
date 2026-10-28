@@ -1,6 +1,6 @@
 # Job Alert -> Telegram (LinkedIn + JobStreet)
 
-Checks LinkedIn (and JobStreet, when run locally) for new entry-level postings around
+Checks LinkedIn and JobStreet for new entry-level postings around
 Kuala Lumpur / Selangor and pings you on Telegram the moment it finds something new.
 Runs on GitHub Actions, so it works even when your PC is off.
 
@@ -20,7 +20,8 @@ the company is on your target list.
 - A GitHub Actions workflow runs `linkedin_job_alert.py` every 2 hours, 8am–10pm
   Malaysia time (8 runs/day).
 - For every search keyword, the script pulls LinkedIn's public job-search results
-  (no login needed) from the last 3 hours.
+  from the last 3 hours and JobStreet's search API results from the last 24 hours
+  (no login needed for either).
 - Each title is checked against the track gates (see *Tuning it*). Remote roles,
   non-Malaysia roles, and roles with a shown salary under RM 3,000 are dropped.
 - New matches are pushed to Telegram. A job is only remembered in `seen_jobs.json`
@@ -36,12 +37,20 @@ own job alerts: save a search on linkedin.com and toggle "Email me about new job
 
 ### JobStreet
 
-JobStreet blocks GitHub's datacenter IPs, so the workflow runs with
-`JOBSTREET_ENABLED=false`. Run the script on your own PC to include JobStreet:
+JobStreet is read through its public JSON search API (the same one its website
+uses), which works from GitHub's runners, so it runs on every scheduled check
+alongside LinkedIn. It searches the last 24 hours in Kuala Lumpur and Selangor for
+every keyword, plus a narrower keyword set in Johor Bahru and Penang (see
+`JOBSTREET_LOCATION_CONFIGS`). Set `JOBSTREET_ENABLED: "false"` in the workflow to
+switch it off.
+
+### Dry run
+
+To see what would be sent without messaging Telegram or touching `seen_jobs.json`:
 
 ```bash
 pip install -r requirements.txt
-TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=123456789 python3 linkedin_job_alert.py
+python3 linkedin_job_alert.py --dry-run
 ```
 
 ## One-time setup (~10 minutes)
@@ -94,7 +103,10 @@ UTC+8, so subtract 8 hours.
 
 ## If it stops sending anything
 
-Usually LinkedIn changed their page's HTML class names. Open the Actions run logs.
-If you see `Found 0 new matching job(s)` for several days in a row when you'd expect
-matches, the CSS selectors in `fetch_jobs_linkedin()` likely need updating. If you
+Usually LinkedIn changed their page's HTML class names, or JobStreet changed its
+API. Open the Actions run logs and look for `[warn] LinkedIn request failed` or
+`[warn] JobStreet request failed`. If you see `Found 0 new matching job(s)` for
+several days in a row when you'd expect matches, the CSS selectors in
+`fetch_jobs_linkedin()` or the parameters in `fetch_jobs_jobstreet()` likely need
+updating. If you
 see `Sent 0, failed N`, check the Telegram secrets.
